@@ -9,20 +9,24 @@ ARG BASE_IMAGE="nvcr.io/nvidia/cuda-dl-base"
 ARG BASE_IMAGE_TAG="25.01-cuda12.8-devel-ubuntu24.04"
 ARG RELEASE_BUILD
 ARG RUNTIME_IMAGE="nvcr.io/nvidia/cuda"
-ARG RUNTIME_IMAGE_TAG="12.4.1-runtime-ubuntu24.04"
+ARG RUNTIME_IMAGE_TAG="12.8.1-runtime-ubuntu24.04"
 
+# Define general architecture ARGs for supporting both x86 and aarch64 builds.
+#   ARCH: Used for package suffixes (e.g., amd64, arm64)
+#   ARCH_ALT: Used for Rust targets, manylinux suffix (e.g., x86_64, aarch64)
+#
+# Default values are for x86/amd64:
+#   --build-arg ARCH=amd64 --build-arg ARCH_ALT=x86_64
+#
+# For arm64/aarch64, build with:
+#   --build-arg ARCH=arm64 --build-arg ARCH_ALT=aarch64
+#
+# NOTE: There isn't an easy way to define one of these values based on the other value
+# without adding if statements everywhere, so just define both as ARGs for now.
 ARG ARCH=amd64
 ARG ARCH_ALT=x86_64
 
 FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS nixl_base
-
-ENV OPENSSL_FORCE_FIPS_MODE=0
-ENV PYTHONHTTPSVERIFY=0
-
-RUN if [ -f /etc/system-fips ]; then \
-      echo "Disabling FIPS inside container" && \
-      rm -f /etc/system-fips; \
-    fi
 
 # Redeclare ARCH and ARCH_ALT so they're available in this stage
 ARG ARCH
@@ -42,14 +46,6 @@ COPY --from=nixl . .
 
 FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS base
 
-ENV OPENSSL_FORCE_FIPS_MODE=0
-ENV PYTHONHTTPSVERIFY=0
-
-RUN if [ -f /etc/system-fips ]; then \
-      echo "Disabling FIPS inside container" && \
-      rm -f /etc/system-fips; \
-    fi
-
 # Redeclare ARCH and ARCH_ALT so they're available in this stage
 ARG ARCH
 ARG ARCH_ALT
@@ -65,15 +61,25 @@ RUN apt-get update -y && \
     ninja-build \
     pybind11-dev \
     # Rust build dependencies
-    clang \
+	clang \
     libclang-dev \
-    git \
+	git \
     # Install utilities
     nvtop \
     tmux \
     vim \
     autoconf \
     libtool
+
+WORKDIR /workspace
+
+### TODO: Bring back UCX EFA setup once we are confident it works with IB devices
+ENV CPATH=/usr/include:$CPATH
+ENV PATH=/usr/bin:$PATH
+ENV PKG_CONFIG_PATH=/usr/lib/pkgconfig:$PKG_CONFIG_PATH
+SHELL ["/bin/bash", "-c"]
+
+WORKDIR /workspace
 
 ### NIXL SETUP ###
 # Copy nixl source, and use commit hash as cache hint
@@ -107,6 +113,7 @@ RUN wget --tries=3 --waitretry=5 https://github.com/etcd-io/etcd/releases/downlo
     rm /tmp/etcd.tar.gz
 ENV PATH=/usr/local/bin/etcd/:$PATH
 
+
 ### VIRTUAL ENVIRONMENT SETUP ###
 
 # Install uv and create virtualenv
@@ -125,16 +132,18 @@ RUN if [ "$ARCH" = "arm64" ]; then \
     else \
         cd /opt/nixl && uv pip install . ; \
     fi
-    
+
 # Install sglang
-# Once either 0.4.6post6 or 0.4.7 is released, we can switch back to using the published version
-# This commit references a fix to add DP attention based routing along with other perf fixes https://github.com/sgl-project/sglang/pull/6884
-ARG SGLANG_COMMIT="f1569876d54dd3b6601f5280f12652e9fbb1375c"
+# This commit references a NIXL fix that was releasted after the 0.4.8.post1 release https://github.com/sgl-project/sglang/pull/7330
+ARG SGLANG_COMMIT="bb9b608c86ebad7d9d01e29fe058bc184dc7285f"
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone https://github.com/sgl-project/sglang.git && \
     cd sglang && \
     git checkout ${SGLANG_COMMIT} && \
     uv pip install -e "python[all]"
+
+# Set env var that allows for forceful shutdown of inflight requests in SGL's TokenizerManager
+ENV SGL_FORCE_SHUTDOWN=1
 
 # Common dependencies
 RUN --mount=type=bind,source=./container/deps/requirements.txt,target=/tmp/requirements.txt \
@@ -193,14 +202,6 @@ ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-16}
 
 FROM base AS local-dev
 
-ENV OPENSSL_FORCE_FIPS_MODE=0
-ENV PYTHONHTTPSVERIFY=0
-
-RUN if [ -f /etc/system-fips ]; then \
-      echo "Disabling FIPS inside container" && \
-      rm -f /etc/system-fips; \
-    fi
-
 # https://code.visualstudio.com/remote/advancedcontainers/add-nonroot-user
 # Will use the default ubuntu user, but give sudo access
 # Needed so files permissions aren't set to root ownership when writing from inside container
@@ -250,14 +251,6 @@ ARG ARCH_ALT
 
 FROM quay.io/pypa/manylinux_2_28_${ARCH_ALT} AS wheel_builder
 
-ENV OPENSSL_FORCE_FIPS_MODE=0
-ENV PYTHONHTTPSVERIFY=0
-
-RUN if [ -f /etc/system-fips ]; then \
-      echo "Disabling FIPS inside container" && \
-      rm -f /etc/system-fips; \
-    fi
-
 ARG CARGO_BUILD_JOBS
 # Set CARGO_BUILD_JOBS to 16 if not provided
 # This is to prevent cargo from building $(nproc) jobs in parallel,
@@ -303,10 +296,10 @@ COPY launch /workspace/launch
 COPY deploy/sdk /workspace/deploy/sdk
 
 RUN cargo build \
-    --release \
-    --locked \
-    --features dynamo-llm/block-manager \
-    --workspace
+	--release \
+	--locked \
+	--features dynamo-llm/block-manager \
+	--workspace
 
 # Build dynamo wheel
 RUN uv build --wheel --out-dir /workspace/dist && \
@@ -317,19 +310,11 @@ RUN uv build --wheel --out-dir /workspace/dist && \
         uv run --python 3.11 maturin build --release --features block-manager --out /workspace/dist && \
         uv run --python 3.10 maturin build --release --features block-manager --out /workspace/dist; \
     fi
-    
+
 #######################################
 ########## CI Minimum Image ###########
 #######################################
 FROM base AS ci_minimum
-
-ENV OPENSSL_FORCE_FIPS_MODE=0
-ENV PYTHONHTTPSVERIFY=0
-
-RUN if [ -f /etc/system-fips ]; then \
-      echo "Disabling FIPS inside container" && \
-      rm -f /etc/system-fips; \
-    fi
 
 ENV DYNAMO_HOME=/workspace
 ENV CARGO_TARGET_DIR=/workspace/target
@@ -376,46 +361,15 @@ ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu/
 ########################################
 FROM ci_minimum AS dev
 
-ENV OPENSSL_FORCE_FIPS_MODE=0
-ENV PYTHONHTTPSVERIFY=0
+ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
 
-RUN if [ -f /etc/system-fips ]; then \
-      echo "Disabling FIPS inside container" && \
-      rm -f /etc/system-fips; \
-    fi
-
-#ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
-
-#CMD []
-#ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
-#CMD ["/bin/bash","-c","tail -f /dev/null"]
-
-WORKDIR /workspace/examples/sglang
-
-EXPOSE 8000
-
-ENTRYPOINT ["/bin/bash"]
-CMD ["-c", "\
-etcd --advertise-client-urls http://0.0.0.0:2379 --listen-client-urls http://0.0.0.0:2379 > /tmp/etcd.log 2>&1 & \
-nats-server --jetstream > /tmp/nats.log 2>&1 & \
-exec dynamo serve graphs.embedding:Frontend -f ./configs/embedding.yaml"]
-
-
-
+CMD []
 
 ####################################
 ########## Runtime Image ###########
 ####################################
 
 FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS runtime
-
-ENV OPENSSL_FORCE_FIPS_MODE=0
-ENV PYTHONHTTPSVERIFY=0
-
-RUN if [ -f /etc/system-fips ]; then \
-      echo "Disabling FIPS inside container" && \
-      rm -f /etc/system-fips; \
-    fi
 
 WORKDIR /workspace
 ENV DYNAMO_HOME=/workspace
@@ -448,42 +402,5 @@ RUN --mount=type=bind,source=./container/launch_message.txt,target=/workspace/la
 # Copy examples
 COPY ./examples examples/
 
-# etcd --advertise-client-urls http://localhost:2379 --listen-client-urls http://localhost:2379 &
-
-# Set working directory to where your config lives
-WORKDIR /workspace/examples/sglang
-
-# Install mc
-ENV TERM=xterm
-RUN apt-get update && apt-get install -y mc
-
-# Prevent GPU init crash if not available (esp. on ACA console attach)
-ENV NVIDIA_VISIBLE_DEVICES=void
-ENV NVIDIA_DRIVER_CAPABILITIES=none
-
-
-#ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
-#CMD ["/bin/bash","-c","tail -f /dev/null"]
-
-WORKDIR /workspace/examples/sglang
-
-ENTRYPOINT ["/bin/bash"]
-CMD ["-c", "tail -f /dev/null"]
-
-
-#etcd --advertise-client-urls http://0.0.0.0:2379 --listen-client-urls http://0.0.0.0:2379 > /tmp/etcd.log 2>&1 & \
-#nats-server --jetstream > /tmp/nats.log 2>&1 & \
-#exec dynamo serve graphs.embedding:Frontend -f ./configs/embedding.yaml"]
-
-
-# --- Startup ---
-
-#ENTRYPOINT ["/bin/bash"]
-#CMD ["-c", "sleep infinity"]
-
-#ENTRYPOINT ["bash", "-c", "etcd --advertise-client-urls http://0.0.0.0:2379 --listen-client-urls http://0.0.0.0:2379 > /tmp/etcd.log 2>&1 & nats-server --jetstream > /tmp/nats.log 2>&1 & exec dynamo serve graphs.embedding:Frontend -f ./configs/embedding.yaml"]
-
-#CMD ["/bin/bash", "-c", "sleep infinity"]
-
-#CMD ["/bin/bash"]
-#CMD []
+ENTRYPOINT [ "/usr/bin/bash" ]
+CMD []
