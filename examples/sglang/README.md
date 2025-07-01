@@ -109,6 +109,15 @@ cd /workspace/examples/sglang
 dynamo serve graphs.disagg:Frontend -f ./configs/disagg.yaml
 ```
 
+#### Embedding Models
+
+We support deploying embedding models via SGLang as well! Here's an example that uses the [intfloat/e5-base-v2](https://huggingface.co/intfloat/e5-base-v2) model.
+
+```bash
+cd /workspace/examples/sglang
+dynamo serve graphs.embedding:Frontend -f ./configs/embedding.yaml
+```
+
 ##### Disaggregated with MoE models and DP attention
 
 SGLang also supports DP attention for MoE models. We provide an example config for this in `configs/disagg-dp-attention.yaml` which is based on the [DeepSeek-R1-Small-2layers](https://huggingface.co/silence09/DeepSeek-R1-Small-2layers) model. You can use this configuration to test out disaggregated serving on a single node before scaling to the full DeepSeek-R1 model across multiple nodes.
